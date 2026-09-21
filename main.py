@@ -14,6 +14,7 @@ KOBIS(영화진흥위원회) 오픈API를 활용한 영화 대시보드
 """
 
 import requests
+import calendar
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -165,6 +166,7 @@ def get_kobis_key():
 # =========================================================
 # 3. 일별 박스오피스 조회
 # =========================================================
+@st.cache_data(show_spinner=False, ttl=60 * 30)
 def fetch_box_office(api_key: str, target_dt: str):
     """
     KOBIS 일별 박스오피스 API를 호출합니다.
@@ -216,13 +218,69 @@ def build_dataframe(movie_list: list) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner="연간 누적 박스오피스를 집계하는 중입니다...", ttl=60 * 60 * 12)
+def fetch_yearly_cumulative_top(api_key: str, year: int, yesterday_dt: str, top_n: int = 10):
+    """
+    그 해(year)에 개봉한 영화들의 '누적 관객수' 순위를 근사치로 계산합니다.
+
+    ※ KOBIS 오픈API에는 연간 박스오피스 전용 엔드포인트가 없어서, 이미 검증된
+      일별 박스오피스 API(searchDailyBoxOfficeList.json)의 TOP10 스냅샷을
+      매달 말일 + 어제 날짜 기준으로 모아서 계산합니다.
+      일별 박스오피스의 audiAcc는 '그 영화가 개봉한 뒤 해당 날짜까지의 누적 관객수'이므로,
+      개봉일이 그 해(year)인 영화라면 스냅샷에서 본 가장 큰 audiAcc 값이 곧 그 해의
+      누적 관객수와 사실상 같습니다.
+      다만 TOP10 밖으로 완전히 밀려난 뒤 다시 등장하지 않은 영화는 값이 실제보다
+      낮게 잡힐 수 있는 근사치라는 점을 참고해 주세요.
+    """
+    yesterday = datetime.strptime(yesterday_dt, "%Y%m%d")
+
+    # 이미 끝난 달은 말일, 이번 달은 어제 날짜로 스냅샷을 잡습니다.
+    snapshot_dates = []
+    for month in range(1, yesterday.month):
+        last_day = calendar.monthrange(year, month)[1]
+        snapshot_dates.append(f"{year}{month:02d}{last_day:02d}")
+    snapshot_dates.append(yesterday_dt)
+
+    best_by_movie = {}
+
+    for target_dt in snapshot_dates:
+        movie_list, error_message = fetch_box_office(api_key, target_dt)
+        if error_message is not None:
+            continue  # 스냅샷 하나가 실패해도 전체 집계는 계속 진행합니다.
+
+        for movie in movie_list:
+            open_dt = movie.get("openDt", "")
+            if not (len(open_dt) == 8 and open_dt.startswith(str(year))):
+                continue
+
+            movie_key = movie.get("movieCd") or movie.get("movieNm", "")
+            audi_acc = pd.to_numeric(movie.get("audiAcc", "0"), errors="coerce")
+            audi_acc = 0 if pd.isna(audi_acc) else int(audi_acc)
+
+            if movie_key not in best_by_movie or audi_acc > best_by_movie[movie_key]["audiAcc"]:
+                best_by_movie[movie_key] = {
+                    "movieNm": movie.get("movieNm", ""),
+                    "openDt": open_dt,
+                    "audiAcc": audi_acc,
+                }
+
+    if not best_by_movie:
+        return [], f"📭 {year}년 개봉작의 누적 박스오피스 데이터를 찾지 못했습니다.\n\n잠시 후 다시 시도해 주세요."
+
+    ranked = sorted(best_by_movie.values(), key=lambda m: m["audiAcc"], reverse=True)
+    return ranked[:top_n], None
+
+
 # =========================================================
 # 4. 영화 목록 조회 (MBTI 추천 · 장르 검색에서 공용으로 사용)
 # =========================================================
 @st.cache_data(show_spinner="최근 영화 목록을 불러오는 중입니다...", ttl=60 * 60 * 6)
-def fetch_recent_movie_list(api_key: str, open_start_dt: str, open_end_dt: str, max_pages: int = 5):
+def fetch_recent_movie_list(api_key: str, open_start_year: str, open_end_year: str, max_pages: int = 8):
     """
-    지정한 개봉일 범위의 영화 목록을 여러 페이지에 걸쳐 가져와 하나로 합칩니다.
+    지정한 개봉연도(YYYY) 범위의 영화 목록을 여러 페이지에 걸쳐 가져와 하나로 합칩니다.
+    ※ KOBIS 영화목록 조회 API의 openStartDt/openEndDt는 날짜(yyyymmdd)가 아니라
+      '연도 4자리(YYYY)'만 받습니다. 실제 정확한 개봉일 필터링은 이 함수 밖에서
+      응답에 담긴 openDt(전체 날짜) 값을 가지고 따로 처리합니다.
     성공하면 (영화 목록, None), 문제가 있으면 ([], "안내 문구")를 반환합니다.
     """
     all_movies = []
@@ -232,8 +290,8 @@ def fetch_recent_movie_list(api_key: str, open_start_dt: str, open_end_dt: str, 
             "key": api_key,
             "curPage": page,
             "itemPerPage": 100,
-            "openStartDt": open_start_dt,
-            "openEndDt": open_end_dt,
+            "openStartDt": open_start_year,
+            "openEndDt": open_end_year,
         }
         try:
             response = requests.get(MOVIE_LIST_URL, params=params, timeout=10)
@@ -270,6 +328,23 @@ def fetch_recent_movie_list(api_key: str, open_start_dt: str, open_end_dt: str, 
         return [], "📭 해당 기간에 개봉한 영화 데이터를 찾지 못했습니다.\n\n조회 기간을 넓히거나 잠시 후 다시 시도해 주세요."
 
     return all_movies, None
+
+
+def filter_movies_within_days(movies: list, end_dt: str, days: int) -> list:
+    """
+    응답에 담긴 실제 개봉일(openDt, yyyymmdd 8자리)을 기준으로,
+    end_dt로부터 최근 days일 이내에 개봉한 영화만 남깁니다.
+    yyyymmdd 형식은 문자열 그대로 크기 비교가 가능합니다.
+    """
+    end_date = datetime.strptime(end_dt, "%Y%m%d")
+    start_dt = (end_date - timedelta(days=days)).strftime("%Y%m%d")
+
+    result = []
+    for m in movies:
+        open_dt = m.get("openDt", "")
+        if len(open_dt) == 8 and open_dt.isdigit() and start_dt <= open_dt <= end_dt:
+            result.append(m)
+    return result
 
 
 def parse_genres(genre_alt: str) -> list:
@@ -380,11 +455,17 @@ def render_mbti_tab(api_key: str):
     selected_mbti = st.selectbox("당신의 MBTI를 선택하세요", list(MBTI_GENRE_MAP.keys()))
 
     end_dt = get_yesterday_kst()
-    start_dt = (datetime.strptime(end_dt, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
+    start_year = str(int(end_dt[:4]) - 1)
+    end_year = end_dt[:4]
 
-    movies, error_message = fetch_recent_movie_list(api_key, start_dt, end_dt)
+    movies, error_message = fetch_recent_movie_list(api_key, start_year, end_year)
     if error_message is not None:
         st.error(error_message)
+        return
+
+    movies = filter_movies_within_days(movies, end_dt, days=365)
+    if not movies:
+        st.info("😢 최근 1년 안에 개봉한 영화 데이터를 찾지 못했습니다. 잠시 후 다시 시도해 주세요.")
         return
 
     preferred_genres = set(MBTI_GENRE_MAP[selected_mbti])
@@ -418,11 +499,17 @@ def render_genre_search_tab(api_key: str):
         return
 
     end_dt = get_yesterday_kst()
-    start_dt = (datetime.strptime(end_dt, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
+    start_year = str(int(end_dt[:4]) - 1)
+    end_year = end_dt[:4]
 
-    movies, error_message = fetch_recent_movie_list(api_key, start_dt, end_dt)
+    movies, error_message = fetch_recent_movie_list(api_key, start_year, end_year)
     if error_message is not None:
         st.error(error_message)
+        return
+
+    movies = filter_movies_within_days(movies, end_dt, days=365)
+    if not movies:
+        st.info("😢 최근 1년 안에 개봉한 영화 데이터를 찾지 못했습니다. 잠시 후 다시 시도해 주세요.")
         return
 
     selected_set = set(selected_genres)
